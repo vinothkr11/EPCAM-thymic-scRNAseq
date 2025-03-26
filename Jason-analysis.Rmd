@@ -1,0 +1,881 @@
+---
+title: "Analysis of Jason's single cell gene expression data"
+analysis by: "Vinothkumar Rajan"
+output: html_document
+date: "2024-04-30"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+The current experiment is a cell multiplex experiment involving EpCam+ sorted mouse Thymic Epithelial Fibroblast, where 6 samples were hash tagged using Totalseq A HashTag antibodies and combined together for a single run in 10x chromium. The GEX was preprocessed with cellranger 8.0 and the CiteSeq data was preprocessed using Cite-Seq-Count. Both analysis yielded matrix files that is being used to create a Seurat object.  
+
+## Setup the working environment
+
+```{r message=FALSE, warning=FALSE}
+library(dplyr)
+library(Seurat)
+library(sctransform)
+library(patchwork)
+library(ggplot2)
+library(glmGamPoi)
+library(lme4)
+library(magrittr)
+library(scCustomize)
+library(presto)
+library(edgeR)
+library(matrixStats)
+library(tibble)
+library(ggrepel)
+lapply(c("HGNChelper","openxlsx"), library, character.only = T)
+library(SCpubr)
+library(decoupleR)
+library(ReactomeGSA)
+```
+
+## Load the data and preprocess to have the same barcodes in cells and 
+```{r data loading}
+gex_data<-Read10X("filtered_feature_bc_matrix/")
+hto_data<-Read10X("umi_count/", gene.column=1)
+hto_data <- hto_data[-c(7),]
+current_col_names <- colnames(hto_data)
+new_col_names <- paste0(current_col_names, "-1")
+colnames(hto_data) <- new_col_names
+current_row_names <- rownames(hto_data)
+new_row_names <- gsub("-.*", "", current_row_names)
+rownames(hto_data) <- new_row_names
+dim(hto_data)
+dim(gex_data)
+joint.bcs <- intersect(colnames(gex_data), colnames(hto_data))
+gex_data <- gex_data[, joint.bcs]
+hto_data <- as.matrix(hto_data[, joint.bcs])
+
+# remove the variable unmapped from HTO object
+
+dim(hto_data)
+dim(gex_data)
+```
+
+## Create Seurat Object
+
+Creating a seurat object with the gene expression data and adding the HTO data as a seperate assay
+
+```{r seurat object creation}
+data <- CreateSeuratObject(counts = gex_data,
+                           project = "Jason data",  #Name this whatever.
+                           names.delim = NULL)  # Don't try and parse the sample names
+
+HTO <- CreateAssay5Object(counts = hto_data)
+data[["HTO"]] <- HTO
+```
+
+## Filter poor quality or uninteresting cells
+
+```{r data cleaning}
+#Assess percent of mitochondrial counts in each cell 
+data[["percent_mt"]] <- PercentageFeatureSet(object = data, 
+                                             pattern = "^mt-")
+
+#Violin plot
+VlnPlot(object = data, 
+        features = c("nFeature_RNA", 
+                   "nCount_RNA", 
+                   "percent_mt"), 
+        ncol = 3)
+
+#Other plotting otions
+plot1 <- FeatureScatter(object = data, 
+                        feature1 = "nCount_RNA", 
+                        feature2 = "percent_mt")
+plot2 <- FeatureScatter(object = data,
+                        feature1 = "nCount_RNA", 
+                        feature2 = "nFeature_RNA")
+plot1 + plot2
+
+#Subset data
+data <- subset(x = data, 
+               subset =  nFeature_RNA > 200 & 
+                 nCount_RNA > 5000 & 
+                 percent_mt < 15)
+
+VlnPlot(object = data, 
+        features = c("nFeature_RNA",
+                   "nCount_RNA",
+                   "percent_mt"),
+        ncol = 3)
+
+```
+
+## SCTransform normalization
+
+```{r sctransform}
+options(future.globals.maxSize = 1024^3 * 4)  # Set to 4 GiB
+data <- SCTransform(data, method= "glmGamPoi", verbose = FALSE)
+```
+
+## Normalize and demultiplex HTO data
+
+```{r hto-normalization}
+data <- NormalizeData(data, assay = "HTO", normalization.method = "CLR")
+data <- HTODemux(data, assay = "HTO", positive.quantile = 0.99)
+table(data$HTO_classification.global)
+```
+
+
+```{r singlet-vs-doublet}
+Idents(data) <- "HTO_classification.global"
+VlnPlot(data, features = "nCount_RNA", pt.size = 0.1, log = TRUE)
+```
+##Visualize HTO data
+
+```{r HTO-data-visualization}
+DefaultAssay(data) <- "HTO"
+data <- ScaleData(data, features = rownames(data),
+    verbose = FALSE)
+data <- RunPCA(data, features = rownames(data), approx = FALSE)
+datat <- RunTSNE(data, dims = 1:8, perplexity = 100)
+DimPlot(data)
+```
+
+##Extract singlet data and perform further processing
+
+```{r subset-singlet}
+singlets <- subset(data, idents = "Singlet")
+```
+## Dimensionality reduction
+
+### Linear dimensionality reduction using PCA
+
+```{r linear-dimensionality}
+DefaultAssay(singlets) <- "SCT"
+# Use the highly variable genes to find principal components
+singlets <- RunPCA(object = singlets, verbose = FALSE)  
+
+#Examine and visualize PCA results a few different ways
+print(x = singlets[["pca"]], dims = 1:5, nfeatures = 5)
+
+DimPlot(singlets, reduction = "pca")
+
+ElbowPlot(singlets)
+
+VizDimLoadings(object = singlets, dims = 1:2, reduction = "pca")
+
+DimPlot(singlets, reduction = "pca", group.by = "HTO_classification")
+
+```
+
+
+### Nonlinear dimensionality reduction for visualization using UMAP
+
+```{r umap}
+singlets <- RunUMAP(singlets, dims = 1:10, verbose = FALSE)
+DimPlot(singlets, reduction = "umap")
+DimPlot(singlets, reduction = "umap", group.by = "HTO_classification")
+
+p1 <- SCpubr::do_DimPlot(sample = singlets,
+                        label = FALSE,
+                        group.by = "HTO_classification",
+                        raster = FALSE,
+                        repel=TRUE, legend.position = "bottom")
+```
+
+## Clustering
+
+```{r clustering}
+singlets <- FindNeighbors(singlets, dims = 1:10)
+singlets <- FindClusters(singlets, resolution = 0.5)
+
+DimPlot(singlets, reduction = "umap", label = TRUE) 
+DimPlot(singlets, reduction = "pca", label = TRUE)
+
+p2 <- SCpubr::do_DimPlot(sample = singlets,
+                        label = FALSE,
+                        raster = FALSE,
+                        repel=TRUE, legend.position = "bottom")
+```
+##Cell Annotation
+
+## Find markers
+
+```{r find markers, fig.height = 9, fig.width=10 }
+# find markers for every cluster compared to all remaining cells, report only the positive ones
+markers <- FindAllMarkers(singlets, 
+                               only.pos = TRUE, 
+                               min.pct = 0.25, 
+                               logfc.threshold = 0.25)
+markers %>%
+  group_by(., cluster) %>% 
+  top_n(., n = 10, wt = avg_log2FC) -> top10
+
+DoHeatmap(singlets, features = top10$gene) + NoLegend()
+```
+
+### Evaluating WT vs KO distribution in UMAP
+
+```{r establishing-phenotype, fig.width=10}
+sample_names <- gsub("[0-9]", "", singlets$HTO_classification)
+phenotype <- ifelse(grepl("WT", sample_names), "WT", "KO")
+singlets$phenotype <- factor(phenotype)
+DimPlot_scCustom(singlets, reduction = "umap", split.by = "phenotype")&theme_bw() & theme()
+
+p3 <- SCpubr::do_DimPlot(sample = singlets,
+                        label = FALSE,
+                        split.by = "phenotype",
+                        raster = FALSE,
+                        repel=TRUE, legend.position = "bottom")
+```
+
+```{r featureplots, fig.height =12, fig.width= 10 }
+genes_list_1 <- c("Psmb11", "Dll4", "Ccl25", "Enpep", "Ly75", "Cd83") 
+genes_list_2 <- c("Prss16", "Ackr4", "Aire", "Fezf2", "Cd80", "Krt5") 
+genes_list_3 <- c("Itga6", "Ccl21a", "Ccl19", "Irga2", "Krt10", "Pigr") 
+genes_list_4 <- c("H2-Aa", "Cldn3", "Cldn4", "Tnfrsf11a", "Epcam")
+FeaturePlot_scCustom(singlets, genes_list_1 ) + plot_annotation(title = "Gene list 1", theme = theme(plot.title = element_text(size = 20, hjust = 0.5)))&theme_bw() & theme()
+FeaturePlot_scCustom(singlets, genes_list_2 ) + plot_annotation(title = "Gene list 2", theme = theme(plot.title = element_text(size = 20, hjust = 0.5)))&theme_bw() & theme()
+FeaturePlot_scCustom(singlets, genes_list_3 ) + plot_annotation(title = "Gene list 3", theme = theme(plot.title = element_text(size = 20, hjust = 0.5)))&theme_bw() & theme()
+FeaturePlot_scCustom(singlets, genes_list_4 ) + plot_annotation(title = "Gene list 4", theme = theme(plot.title = element_text(size = 20, hjust = 0.5)))&theme_bw() & theme()
+```
+
+### Performing supervised annoation with gene signatures from literature
+Previously [Campinoti et al., 2020](https://www.nature.com/articles/s41467-020-20082-7) published a detailed cellular overview of the human postnatal thymus. We took the gene signatures corresponding to mTEC, cTEC and comTEC and applied to our dataset to classify TECs. 
+
+```{r supervised annotation, fig.height =12, fig.width= 12 }
+early_progenitor_gene_list <- list(c("Ackr4", "Adamts10", "Agrn", "Aldh2", "Aldh6a1", "Amotl1", "Amotl2", "Antxr1", "Apoe",
+               "Ar", "Bcam", "Bcl11a", "Bcl2", "Bmp4", "Btg2", "Cbx6", "Ccdc80", "Cdh11", "Cldn8", 
+               "Clec11a", "Clstn1", "Col18a1", "Cpne8", "Cthrc1", "Cyp1b1", "Dcn", "Ddr1", "Dhrs3", 
+               "Dlk2", "Dnajc13", "Dpp6", "Dpysl2", "Dsc3", "Egr1", "Eid1", 
+               "Fkbp9", "Fmod", "Fos", "Fosb", "Frmd6", "Fstl1", "Ogn", "Gas1", "Pak3", "Gbp2", 
+               "Palld", "Gnaq", "Pdpn", "Gpm6b", "Penk", "Gprasp1", "Plxdc2", "Gstm2", "Pmp22", 
+               "H2-DMa", "Prelp", "Hes6", "Prrg3", "Hic1", "Prss23", "Hsd17b10", "Ptprz1", "Igfbp2", 
+               "Igfbp3", "Pygb", "Igfbp5", "Rbp1", "Igfbp7", "Rnase4", "Iigp1", "Scn1a", 
+               "Il33", "Serpinf1", "Irgm1", "Serpinh1", "Isl1", "Shisa2", "Itm2c", "Slc2a13", "Kazald1", 
+               "Sord", "Lamb1", "Sparc", "Laptm4a", "Spon2", "Limch1", "Spry1", "Ltbp3", "Tcn2", 
+               "Maged1", "Tgfbr2", "Megf6", "Tgfbr3", "Meis1", "Thbd", "Mgll", "Thbs1", "Mgp", 
+               "Timp2", "Myl9", "Tinagl1", "Mylk", "Tnfrsf19", "Nbl1", "Tns1", "Nell2", "Tns3", 
+               "Nfia", "Trim29", "Nfib", "Trp63", "Nfix", "Tspan9", "Nr2f1", "Twsg1", "Nr4a1", 
+               "Txnip", "Nrtn", "Unc119", "Ntrk3", "Vmac", "Oat", "Wls", "Wscd1", "Xdh", "Zfp36"))
+
+postnatal_progenitors_gene_list <- list(c("Acta2", "Apoe", "Ascl1", "Boc", "C1s1", "C3", "Cald1", "Ccl11", "Ccl21a", "Clca3a1", 
+               "Col6a1", "Col6a2", "Ddx60", "Dpysl3", "Dst", "Emp2", "Flna", 
+               "Fst", "Fzd2", "Gas1", "Glul", "Gpx3", "Gsn", "Hpgd", "Htra1", "Id1", "Ifi27l2a", 
+               "Igfbp4", "Igfbp5", "Irf7", "Isg15", "Itga6", "Itgb4", "Krt14", "Krt5", "Krt7", 
+               "Lamb3", "Lars2", "Lifr", "Mgp", "Myl9", "Nrbp2", "S1pr3", "Slc4a11", "Sox4", "Stat2", 
+               "Sult5a1", "Tagln", "Tgfbi", "Tpm2", "Wfikkn2"))
+
+cTEC_gene_list <- list(c("Ccl25", "Cd274", "Cfc1", "Ctsh", "Foxn1", "Kcnip3", "Ly75", "Prss16", "Psmb11", "Scx", "Slc46a2", "Tbx1"))
+
+mTEC_gene_list <- list(c("AA467197", "Adap1", "Adgb", "Aebp2", "Ahcyl2", "Aif1l", "Aire", "Alas1", "Ank", "Ankrd33b",
+               "Anxa10", "Aoc1", "Apoa1", "Apoa4", "Apobec1", "Apoc2", "Aqp3", "Arc", "Asprv1", "Atp1a2", 
+               "Atp1b1", "Atp6v1c1", "AU040320", "Avil", "AW112010", "Bcl2a1a", "Bcl2l1", "Blnk", 
+               "Bmp2k", "Cadps", "Calca", "Calcb", "Casp1", "Casz1", "Ccdc184", "Ccdc88a", "Ccl17", "Ccl20", 
+               "Ccl22", "Ccl27a", "Ccl5", "Ccl6", "Ccl9", "Ccr7", "Cd52", "Cd70", "Cdh17", "Cdhr5", "Cdkn1a", 
+               "Cdkn1c", "Cdkn2b", "Cdx1", "Chil1", "Ckmt1", "Cldn13", "Cldn3", "Cldn4", "Cldn7", "Cnp", 
+               "Cpeb4", "Crabp1", "Crhbp", "Csn2", "Cst6", "Ctrb1", "Ctsh", "Ctss", "Ctsz", "Cxcl2", "Cyba", 
+               "Cybb", "Cyp2a4", "Cystm1", "Defb6", "Dgat2", "Dio1", "Dmkn", "Dmpk", "Dnase1l3", 
+               "Dscaml1", "Eaf2", "Ebi3", "Ehd1", "Elf3", "Eno2", "Espn", "Etv3", "Fabp4", "Fabp6", 
+               "Fabp9", "Fam25c", "Fam89a", "Fcer1g", "Fezf2", "Fgf21", "Fhad1", "Fnbp1", "Fscn1", "Gas7", 
+               "Gbp4", "Gda", "Gdf15", "Gjb2", "Gnat3", "Gnb3", "Gnb4", "Gng13", "Gpa33", "Gramd4", "Grap", 
+               "Grin2c", "Gstm1", "Gstt1", "Guca2b", "H2-Eb2", "H2-Oa", "Hagh", "Hal", "Hamp", "Hdc", "Hopx", 
+               "Icosl", "Igf1", "Igfbp6", "Igsf8", "Il12a", "Il13", "Il1rn", "Il23a", "Il2rg", "Ing1", "Inpp5b", 
+               "Insm1", "Itgb8", "Kcnk6", "Kctd12", "Klk1", "Klk1b11", "Klk7", "Krt10", "Krt16", "Krt20", "Krt77", 
+               "Krt79", "Lad1", "Laptm5", "Lcp1", "Liph", "Lrrc42", "Lsp1", "Ly6i", "Lypd2", "Lypd8", "Lyz1", 
+               "Malat1", "Mctp1", "Mdm2", "Me1", "Mep1a", "Mmp7", "Muc1", "Muc13", "Mxd1", 
+               "Myl7", "Myo15b", "N4bp2l1", "Ncf1", "Ncf4", "Neat1", "Nfkbia", "Nos2", "Nostrin", "Nptx2", "Nsmce1", 
+               "Nsmce2", "Nts", "Nup85", "Oasl1", "Ogfrl1", "Ooep", "Pcp4", "Pgc", "Pglyrp1", "Pglyrp2", 
+               "Pigr", "Pip5k1b", "Pla1a", "Pla2g4a", "Plagl1", "Plb1", "Pld1", "Plekha4", "Pmaip1", "Prap1", "Prg2", 
+               "Prg4", "Prokr2", "Psors1c2", "Ptgds", "Ptgs2", "Pyy", "Rab25", "Rac2", "Rap1gap", "Rarres1", "Reg3g", 
+               "Resp18", "Rnasel", "Rnf128", "Rogdi", "S100a14", "S100a4", "S100a8", "S100a9", "S100g", "Saa3", "Sat1", 
+               "Sel1l3", "Sema4a", "Serpinb12", "Serpinb1a", "Serpinb2", "Serpinb9", "Sgpp1", "Sh2d6", "Sh3tc2", 
+               "Sirt1", "Skint2", "Skint4", "Skint9", "Slc13a2", "Slc43a3", "Wfdc21", "Slc4a8", "Slc5a8", "Slc6a20a", 
+               "Slco5a1", "Smtnl1", "Sncg", "Spink1", "Spink5", "Spock3"))
+
+```
+
+```{r plotting-module scores, fig.width=18, fig.height=4}
+singlets <- AddModuleScore(object = singlets, features = early_progenitor_gene_list, name = "earlypro_score")
+
+singlets <- AddModuleScore(object = singlets, features = postnatal_progenitors_gene_list, name = "postnatal_score")
+
+singlets <- AddModuleScore(object = singlets, features = mTEC_gene_list, name = "mTEC_score")
+
+singlets <- AddModuleScore(object = singlets, features = cTEC_gene_list, name = "cTEC_score")
+
+
+plot1<-FeaturePlot_scCustom(singlets, features="mTEC_score1", reduction="umap", colors_use= viridis_plasma_dark_high, na_color="lightgray", pt.size=0.5, na_cutoff = 0.5)&theme_bw() & theme()& labs(title = "mTEC signature")
+plot2<-FeaturePlot_scCustom(singlets, features="cTEC_score1", reduction="umap", colors_use= viridis_plasma_dark_high, na_color="lightgray", pt.size=0.5, na_cutoff = 0.5)&theme_bw() & theme()& labs(title = "cTEC signature")
+plot3<-FeaturePlot_scCustom(singlets, features="earlypro_score1", reduction="umap", colors_use= viridis_plasma_dark_high, na_color="lightgray", pt.size=0.5, na_cutoff = 0.5)&theme_bw() & theme()& labs(title = "Early Progenitor signature")
+plot4<-FeaturePlot_scCustom(singlets, features="postnatal_score1", reduction="umap", colors_use= viridis_plasma_dark_high, na_color="lightgray", pt.size=0.5, na_cutoff = 0.5)&theme_bw() & theme()& labs(title = "Postnatal Progenitor signature")
+plot1|plot2|plot3|plot4
+
+```
+#Classifying cluster 3 and 7 
+
+```{r cluster3vs7}
+cluster3.markers <- FindMarkers(singlets, 
+                                ident.1 = 3, 
+                                min.pct = 0.25)
+head(cluster3.markers, n = 10)
+
+cluster7.markers <- FindMarkers(singlets, 
+                                ident.1 = 7, 
+                                min.pct = 0.25)
+head(cluster7.markers, n = 10)
+```
+
+##Finalized cell annotation
+From the above classifications there are the inferred cell annotation
+Cluster 0 - mTEC3
+Cluster 1 - mTEC2
+Cluster 2 - mature cTEC
+Cluster 3 - mTEC1
+Cluster 4 - Postnatal progenitor cells
+Cluster 5 - immature cTEC
+Cluster 6 - Early progenitor cells
+Cluster 7 - Transient amplifying progenitor
+Cluster 8 - Postnatal progenitor cells
+Cluster 9 - Residual
+Cluster 10 - proliferating cTEC
+
+```{r finalized annotation, fig.width=8, fig.height=6}
+cell_annotation <- data.frame(cluster=0:10,
+                             cell_type=c("mTEC3", "mTEC2", "mature cTEC", "mTEC1", "PNP", "immature cTEC", "Early progenitors", "Transient amplifying progenitors", "PNP", "Residual", "proliferating cTEC"))
+
+new.cluster.ids <- c("mTEC3", "mTEC2", "mature cTEC", "mTEC1", "PNP", "immature cTEC", "Early progenitors", "Transient amplifying progenitors", "PNP", "Residual", "proliferating cTEC")
+names(new.cluster.ids) <- levels(singlets)
+singlets <- RenameIdents(singlets, new.cluster.ids)
+singlets$cell_type <- Idents(singlets)
+DimPlot_scCustom(singlets, reduction = "umap", label = TRUE, repel = TRUE)&theme_bw() & theme()
+```
+```{r}
+p4 <- SCpubr::do_DimPlot(sample = singlets,
+                        label = FALSE,
+                        raster = FALSE,
+                        repel=TRUE, legend.position = "right")
+
+p4
+
+p1|p2|p4
+```
+
+```{r interferon-signalling, fig.width=18, fig.height=4}
+interferon_markers <- c("Mx1", "Isg15", "Oas1a", "Oas1b", "Oas1g", "Oas2", "Oas3", 
+                        "Rsad2", "Ifit1", "Ifit2", "Ifit3", "Ifi44", "Stat1", 
+                        "Stat2", "Irf7", "Cxcl10", "H2-Ab1", "Irf1", 
+                        "Cxcl9", "Ido1", "Icam1", "Ciita", "Eif2ak2", "Isg20", 
+                         "Zbp1", "Bst2")
+# Define mouse interferon response markers for each type
+interferonI_genes <- c("Mx1", "Isg15", "Oas1a", "Oas1b", "Oas1g", "Oas2", "Oas3", "Rsad2", "Ifit1", "Ifit2", "Ifit3", "Ifi44", "Stat1", "Stat2", "Irf7", "Cxcl10")
+interferonII_genes <- c("H2-Ab1", "Irf1", "Cxcl9", "Cxcl10", "Ido1", "Icam1", "Ciita")
+interferonIII_genes <- c("Il10rb", "Mx1", "Oas1a", "Oas1b", "Oas1g", "Oas2", "Oas3", "Ifit1", "Ifit2", "Ifit3")
+
+singlets <- AddModuleScore(singlets, features = list(interferon_markers), name = "interferon_score")
+singlets <- AddModuleScore(singlets, features = list(interferonI_genes), name = "interferon1_score")
+singlets <- AddModuleScore(singlets, features = list(interferonII_genes), name = "interferon2_score")
+singlets <- AddModuleScore(singlets, features = list(interferonIII_genes), name = "interferon3_score")
+
+plot5<-FeaturePlot_scCustom(singlets, features="interferon_score1", reduction="umap", colors_use= viridis_plasma_dark_high, na_color="lightgray", pt.size=0.5, na_cutoff = 0.1)&theme_bw() & theme()& labs(title = "Interferon signature")
+plot6<-FeaturePlot_scCustom(singlets, features="interferon1_score1", reduction="umap", colors_use= viridis_plasma_dark_high, na_color="lightgray", pt.size=0.5, na_cutoff = 0.1)&theme_bw() & theme()& labs(title = "Type I Interferon signature")
+plot7<-FeaturePlot_scCustom(singlets, features="interferon2_score1", reduction="umap", colors_use= viridis_plasma_dark_high, na_color="lightgray", pt.size=0.5, na_cutoff = 0.1)&theme_bw() & theme()& labs(title = "Type II Interferon signature")
+plot8<-FeaturePlot_scCustom(singlets, features="interferon3_score1", reduction="umap", colors_use= viridis_plasma_dark_high, na_color="lightgray", pt.size=0.5, na_cutoff = 0.1)&theme_bw() & theme()& labs(title = "Type III Interferon signature")
+
+plot5|plot6|plot7|plot8
+```
+```{r genes of interest, fig.width=12, fig.height=10}
+gene_list_5 <- c("Zfp36l1", "Zfp36l2", "Ets2", "Arnt2", "Tshz2", "Irx3") 
+gene_list_6 <- c("Klf12", "Aebp1", "Ebf1", "Mafa", "Nkx6-2", "Pou2af1") 
+gene_list_7 <- c("Scx", "Cdkn1a", "Cdkn1c", "Ccnd2", "Cables1", "Cdk14")
+gene_list_8 <- c("Rspo1", "Sfrp1", "Shisa4", "Shisal1")
+FeaturePlot_scCustom(singlets, gene_list_5) + plot_annotation(title = "Gene list 1", theme = theme(plot.title = element_text(size = 20, hjust = 0.5)))&theme_bw() & theme()
+FeaturePlot_scCustom(singlets, gene_list_6) + plot_annotation(title = "Gene list 1", theme = theme(plot.title = element_text(size = 20, hjust = 0.5)))&theme_bw() & theme()
+FeaturePlot_scCustom(singlets, gene_list_7) + plot_annotation(title = "Gene list 1", theme = theme(plot.title = element_text(size = 20, hjust = 0.5)))&theme_bw() & theme()
+FeaturePlot_scCustom(singlets, gene_list_8) + plot_annotation(title = "Gene list 1", theme = theme(plot.title = element_text(size = 20, hjust = 0.5)))&theme_bw() & theme()
+```
+
+
+##Odds ratio analysis
+We are calculating the probability of a cell being in a cluster based on whether the cell is WT versus KO. 
+
+```{r odds-ratio, fig.height=5, fig.width=12}
+sample_pheno_data <-  singlets@meta.data %>% select(HTO_classification, phenotype) %>% unique()
+##the number of cells in each mouse in each cluster
+Ncells <- table(singlets@meta.data$cell_type,
+                     singlets@meta.data$HTO_classification) %>% as.data.frame()
+
+colnames(Ncells) <- c("cluster_id", "HTO_classification", "Freq")
+TotalCells <- Ncells %>%
+  group_by(HTO_classification) %>%
+  summarise(TotalCells = sum(Freq))
+
+Ncells %<>% merge(., TotalCells)
+
+Ncells %<>% merge(., sample_pheno_data)
+Clusters <- unique(Ncells$cluster_id)
+Nclusters <- length(Clusters)
+
+##function to estimate the change in the odds of cluster membership from the 5 day to the 11 day time-point
+estimateCellStateChange <- function(k, Ncells, TotalCells, SampleInfo) {
+  require(lme4)
+  require(gdata)
+  print(paste("Cluster", k))
+  Ncells_sub <- Ncells %>%
+    filter(cluster_id==k)
+  
+  glmerFit <- glmer(cbind(Freq, (TotalCells - Freq)) ~ (1|HTO_classification) + phenotype, data=Ncells_sub, family = "binomial", control = glmerControl(optimizer = "bobyqa"))
+  sglmerFit  <- summary(glmerFit)
+  TempRes <- (sglmerFit$coefficients[-1,])
+
+  return(TempRes)
+}
+
+ClusterRes <- sapply(Clusters, estimateCellStateChange, Ncells, TotalCells, SampleInfo)
+ClusterRes %<>% 
+  as.data.frame() %>% 
+  t() 
+row.names(ClusterRes) <-  paste0("Cluster", Clusters)
+ClusterRes <- data.frame(ClusterRes)
+colnames(ClusterRes)[c(1,4)] <- c("logOddsRatio_WT_vs_KO","pvalue")
+
+##perform multiple-testing correction
+ClusterRes %<>% mutate(p.adjust = p.adjust(pvalue, method = "BH"))
+print(ClusterRes)
+
+ggplot(Ncells, aes(x=phenotype, y=(Freq+1)/TotalCells)) +
+  geom_boxplot() +
+  geom_point() +
+  scale_y_log10() +
+  ylab("proportion of cells") +
+  facet_grid(cols = vars(cluster_id)) + theme_bw()
+```
+
+```{r edgeR}
+singlets@meta.data$phenotype <- as.factor(singlets@meta.data$phenotype)
+singlets@meta.data$HTO_classification <- as.factor(singlets@meta.data$HTO_classification)
+singlets[["phenotype"]] <- (singlets@meta.data$phenotype) %>%
+  as.character() %>%
+  gsub(" ", "_", .) %>%
+  make.names()
+singlets$phenotype <- as.factor(singlets$phenotype)
+# Identify clusters to keep
+clusters_toKeep <- table(singlets@meta.data$cell_type, singlets@meta.data$phenotype) %>% 
+  t() %>% 
+  apply(., 2, function(x) median(x)) %>% 
+  subset(., is_greater_than(., 100)) %>% 
+  names()
+
+# Aggregate expression data
+pbData <- AggregateExpression(singlets, assays = "RNA", group.by = c("cell_type", "HTO_classification"))
+
+pb_counts <- pbData$RNA %>% as.data.frame()
+
+# Perform cluster-wise analysis
+clusterwise_pseudobulk_expression_association <- function(cluster, count_data, sample_pheno_data) {
+  
+  print(paste("evaluating cluster", cluster))
+  
+  # Get cluster-specific counts
+  cluster_count_data <- count_data %>% select(starts_with(paste0(cluster)))
+  
+  col_individuals <- sapply(colnames(cluster_count_data), function(x) strsplit(x, "_")[[1]][2])
+  temp_indices <- match(col_individuals, sample_pheno_data$HTO_classification)
+  sample_pheno_data <- sample_pheno_data %>% slice(temp_indices)
+  
+  # Set up the design matrix
+  phenotype <- sample_pheno_data %>% mutate(phenotype = as.factor(phenotype)) %>% .$phenotype
+  
+  # Check if phenotype has at least two levels
+  if (length(levels(phenotype)) < 1) {
+    print(paste("Skipping cluster", cluster, "- not enough levels in phenotype"))
+    return(NULL)
+  }
+  
+  mm <- model.matrix(~ phenotype)
+  colnames(mm) <- levels(phenotype)
+  row.names(mm) <- colnames(cluster_count_data)
+
+  y <- DGEList(counts = cluster_count_data, group = phenotype)
+
+  # Filter out low expressed genes
+  genes_toKeep <- filterByExpr(y, design = mm, min.count=2, min.prop=0.5)
+  print(paste("no. of genes after filtering = ", sum(genes_toKeep)))
+  y <- y[genes_toKeep,,keep.lib.sizes=FALSE]
+
+  # Normalize for between sample differences
+  y <- calcNormFactors(y)
+  
+  # Estimate dispersion
+  y <- estimateDisp(y, design=mm, robust = TRUE) 
+  
+  # Get the Counts-Per-Million in order to visualize the clustering of the samples in a PCA plot
+  cpm <- cpm(y)
+  log2_cpm <- log2(cpm + 0.1*min(cpm[cpm > 0]))
+  
+  # Calculate log-CPM values with log transformation and prior count stabilization
+  log_cpm_counts <- log2_cpm
+  
+  # Estimate variance of the expression of each gene/row
+  variance_per_gene <- rowVars(log_cpm_counts)
+  use_features_for_pca <- variance_per_gene %>% sort(., decreasing = TRUE) %>% names(.)
+  
+  # Pick the top 1000 most variable genes
+  use_features_for_pca <- use_features_for_pca[1:1000]
+ 
+  log_cpm_counts_t <- t(log_cpm_counts[row.names(log_cpm_counts) %in% use_features_for_pca, ])
+  
+  # Run PCA on the log-CPM data
+  res.pca.norm <- prcomp(log_cpm_counts_t, scale = TRUE, rank.=10)
+  
+  # Create a data frame for visualization
+  log_cpm_counts_PCs <- data.frame(sample_pheno_data, res.pca.norm$x)
+  
+  # Print the PCA plot
+  print(ggplot(log_cpm_counts_PCs, aes(x = PC1, y = PC2, color = phenotype)) +
+    geom_point(aes(size=0.1)) +
+    theme_bw() +
+    ggtitle(paste0("cluster_", cluster)) +
+    theme(text = element_text(size = 16)))
+
+  fit <- glmQLFit(y, design=mm)
+  qlf <- glmQLFTest(fit, coef=2)
+  topGenes <- topTags(qlf, n = nrow(y))
+  
+  diff_res <- data.frame(topGenes$table, cluster = rep(cluster, nrow(topGenes$table)))
+
+  return(diff_res)
+}
+
+# Apply the function to all clusters to keep
+all_diff_res <- lapply(clusters_toKeep, clusterwise_pseudobulk_expression_association, pb_counts, sample_pheno_data)
+
+all_diff_res %<>% do.call("rbind", .)
+
+##add adjustment for all hypothesis tests - across all genes and all clusters
+all_diff_res %<>% mutate(p.adj.global = p.adjust(PValue, "fdr"),
+                         p.adj.local = FDR) %>%
+  select(-FDR)
+```
+```{r volcano plot, fig.height=4, fig.width=16}
+mutateddf <- mutate(all_diff_res, sig=ifelse(all_diff_res$p.adj.local<0.01 & (all_diff_res$logFC>1.2 | all_diff_res$logFC<(-1.2)), "Sig", "Not Sig"))
+mutateddf <- rownames_to_column(mutateddf, var = "Gene")
+mutateddf$cluster <- as.factor(mutateddf$cluster)
+input_fg<-subset(mutateddf, sig == "Sig")
+
+# Create volcano plots for each cluster
+
+cluster_mTEC1_bg <- subset(mutateddf, cluster == "mTEC1")
+cluster_mTEC1_fg <- subset(input_fg, cluster == "mTEC1")
+
+plot_mTEC1 <- ggplot(cluster_mTEC1_bg, aes(logFC, -log10(p.adj.local))) +
+    geom_point(color = "grey", alpha = 0.1) +
+    geom_point(data = cluster_mTEC1_fg, aes(col = sig, alpha = 0.4)) +
+    ggtitle(paste("mTEC1")) +
+    theme_bw() +
+    theme(axis.title.x = element_text(size = 14),
+          axis.title.y = element_text(size = 14),
+          legend.position = "none") +
+    xlab("logFC") +
+    ylab("-log10 q value") +
+    geom_text_repel(data = head(cluster_mTEC1_fg, 20), aes(label = Gene), size = 3, 
+                    box.padding = unit(0.1, "lines"),
+                    point.padding = unit(0.1, "lines"))
+
+cluster_mTEC2_bg <- subset(mutateddf, cluster == "mTEC2")
+cluster_mTEC2_fg <- subset(input_fg, cluster == "mTEC2")
+
+plot_mTEC2 <- ggplot(cluster_mTEC2_bg, aes(logFC, -log10(p.adj.local))) +
+    geom_point(color = "grey", alpha = 0.1) +
+    geom_point(data = cluster_mTEC2_fg, aes(col = sig, alpha = 0.4)) +
+    ggtitle(paste("mTEC2")) +
+    theme_bw() +
+    theme(axis.title.x = element_text(size = 14),
+          axis.title.y = element_text(size = 14),
+          legend.position = "none") +
+    xlab("logFC") +
+    ylab("-log10 q value") +
+    geom_text_repel(data = head(cluster_mTEC2_fg, 20), aes(label = Gene), size = 3, 
+                    box.padding = unit(0.1, "lines"),
+                    point.padding = unit(0.1, "lines"))
+
+cluster_mTEC3_bg <- subset(mutateddf, cluster == "mTEC3")
+cluster_mTEC3_fg <- subset(input_fg, cluster == "mTEC3")
+
+plot_mTEC3 <- ggplot(cluster_mTEC3_bg, aes(logFC, -log10(p.adj.local))) +
+    geom_point(color = "grey", alpha = 0.1) +
+    geom_point(data = cluster_mTEC3_fg, aes(col = sig, alpha = 0.4)) +
+    ggtitle(paste("mTEC3")) +
+    theme_bw() +
+    theme(axis.title.x = element_text(size = 14),
+          axis.title.y = element_text(size = 14),
+          legend.position = "none") +
+    xlab("logFC") +
+    ylab("-log10 q value") +
+    geom_text_repel(data = head(cluster_mTEC3_fg, 20), aes(label = Gene), size = 3, 
+                    box.padding = unit(0.1, "lines"),
+                    point.padding = unit(0.1, "lines"))
+
+cluster_PNP_bg <- subset(mutateddf, cluster == "PNP")
+cluster_PNP_fg <- subset(input_fg, cluster == "PNP")
+
+plot_PNP <- ggplot(cluster_PNP_bg, aes(logFC, -log10(p.adj.local))) +
+    geom_point(color = "grey", alpha = 0.1) +
+    geom_point(data = cluster_PNP_fg, aes(col = sig, alpha = 0.4)) +
+    ggtitle(paste("PNP")) +
+    theme_bw() +
+    theme(axis.title.x = element_text(size = 14),
+          axis.title.y = element_text(size = 14),
+          legend.position = "none") +
+    xlab("logFC") +
+    ylab("-log10 q value") +
+    geom_text_repel(data = head(cluster_PNP_fg, 20), aes(label = Gene), size = 3, 
+                    box.padding = unit(0.1, "lines"),
+                    point.padding = unit(0.1, "lines"))
+
+cluster_mcTEC_bg <- subset(mutateddf, cluster == "mature cTEC")
+cluster_mcTEC_fg <- subset(input_fg, cluster == "mature cTEC")
+
+plot_mcTEC <- ggplot(cluster_mcTEC_bg, aes(logFC, -log10(p.adj.local))) +
+    geom_point(color = "grey", alpha = 0.1) +
+    geom_point(data = cluster_mcTEC_fg, aes(col = sig, alpha = 0.4)) +
+    ggtitle(paste("mature cTEC")) +
+    theme_bw() +
+    theme(axis.title.x = element_text(size = 14),
+          axis.title.y = element_text(size = 14),
+          legend.position = "none") +
+    xlab("logFC") +
+    ylab("-log10 q value") +
+    geom_text_repel(data = head(cluster_mcTEC_fg, 20), aes(label = Gene), size = 3, 
+                    box.padding = unit(0.1, "lines"),
+                    point.padding = unit(0.1, "lines"))
+
+cluster_imcTEC_bg <- subset(mutateddf, cluster == "immature cTEC")
+cluster_imcTEC_fg <- subset(input_fg, cluster == "immature cTEC")
+
+plot_imcTEC <- ggplot(cluster_imcTEC_bg, aes(logFC, -log10(p.adj.local))) +
+    geom_point(color = "grey", alpha = 0.1) +
+    geom_point(data = cluster_imcTEC_fg, aes(col = sig, alpha = 0.4)) +
+    ggtitle(paste("immature cTEC")) +
+    theme_bw() +
+    theme(axis.title.x = element_text(size = 14),
+          axis.title.y = element_text(size = 14),
+          legend.position = "none") +
+    xlab("logFC") +
+    ylab("-log10 q value") +
+    geom_text_repel(data = head(cluster_imcTEC_fg, 20), aes(label = Gene), size = 3, 
+                    box.padding = unit(0.1, "lines"),
+                    point.padding = unit(0.1, "lines"))
+
+cluster_EP_bg <- subset(mutateddf, cluster == "Early progenitors")
+cluster_EP_fg <- subset(input_fg, cluster == "Early progenitors")
+
+plot_EP <- ggplot(cluster_EP_bg, aes(logFC, -log10(p.adj.local))) +
+    geom_point(color = "grey", alpha = 0.1) +
+    geom_point(data = cluster_EP_fg, aes(col = sig, alpha = 0.4)) +
+    ggtitle(paste("Early progenitors")) +
+    theme_bw() +
+    theme(axis.title.x = element_text(size = 14),
+          axis.title.y = element_text(size = 14),
+          legend.position = "none") +
+    xlab("logFC") +
+    ylab("-log10 q value") +
+    geom_text_repel(data = head(cluster_EP_fg, 20), aes(label = Gene), size = 3, 
+                    box.padding = unit(0.1, "lines"),
+                    point.padding = unit(0.1, "lines"))
+
+cluster_TAP_bg <- subset(mutateddf, cluster == "Transient amplifying progenitors")
+cluster_TAP_fg <- subset(input_fg, cluster == "Transient amplifying progenitors")
+
+plot_TAP <- ggplot(cluster_TAP_bg, aes(logFC, -log10(p.adj.local))) +
+    geom_point(color = "grey", alpha = 0.1) +
+    geom_point(data = cluster_TAP_fg, aes(col = sig, alpha = 0.4)) +
+    ggtitle(paste("Transient amplifying progenitors")) +
+    theme_bw() +
+    theme(axis.title.x = element_text(size = 14),
+          axis.title.y = element_text(size = 14),
+          legend.position = "none") +
+    xlab("logFC") +
+    ylab("-log10 q value") +
+    geom_text_repel(data = head(cluster_TAP_fg, 20), aes(label = Gene), size = 3, 
+                    box.padding = unit(0.1, "lines"),
+                    point.padding = unit(0.1, "lines"))
+
+plot_mTEC1|plot_mTEC2|plot_mTEC3|plot_PNP
+
+plot_mcTEC|plot_imcTEC|plot_TAP|plot_EP
+```
+```{r}
+DefaultAssay(singlets) <- "SCT"
+p5 <- FeaturePlot_scCustom(singlets, features=c("Ackr4", "Dll4", "Psmb11", "Ccl21a", "Aire", "Fezf2"), reduction="umap", colors_use= viridis_plasma_dark_high, na_color="lightgray", pt.size=0.5, label=FALSE)& NoAxes() & NoLegend()
+p5
+```
+
+```{r}
+wt1_data <- subset(x = singlets, subset = HTO_classification == "WT1")
+wt2_data <- subset(x = singlets, subset = HTO_classification == "WT2")
+wt3_data <- subset(x = singlets, subset = HTO_classification == "WT3")
+ko1_data <- subset(x = singlets, subset = HTO_classification == "KO1")
+ko2_data <- subset(x = singlets, subset = HTO_classification == "KO2")
+ko3_data <- subset(x = singlets, subset = HTO_classification == "KO3")
+
+```
+
+```{r}
+gsva_wt1 <- analyse_sc_clusters(wt1_data, use_interactors = FALSE, verbose = TRUE)
+gsva_wt2 <- analyse_sc_clusters(wt2_data, use_interactors = FALSE, verbose = TRUE)
+gsva_wt3 <- analyse_sc_clusters(wt3_data, use_interactors = FALSE, verbose = TRUE)
+
+gsva_ko1 <- analyse_sc_clusters(ko1_data, use_interactors = FALSE, verbose = TRUE)
+gsva_ko2 <- analyse_sc_clusters(ko2_data, use_interactors = FALSE, verbose = TRUE)
+gsva_ko3 <- analyse_sc_clusters(ko3_data, use_interactors = FALSE, verbose = TRUE)
+
+pathway_wt1 <- pathways(gsva_wt1)
+pathway_wt2 <- pathways(gsva_wt2)
+pathway_wt3 <- pathways(gsva_wt3)
+
+pathway_ko1 <- pathways(gsva_ko1)
+pathway_ko2 <- pathways(gsva_ko2)
+pathway_ko3 <- pathways(gsva_ko3)
+
+colnames(pathway_wt1) <- gsub("\\.Seurat", "", colnames(pathway_wt1))
+colnames(pathway_wt2) <- gsub("\\.Seurat", "", colnames(pathway_wt2))
+colnames(pathway_wt3) <- gsub("\\.Seurat", "", colnames(pathway_wt3))
+
+colnames(pathway_ko1) <- gsub("\\.Seurat", "", colnames(pathway_ko1))
+colnames(pathway_ko2) <- gsub("\\.Seurat", "", colnames(pathway_ko2))
+colnames(pathway_ko3) <- gsub("\\.Seurat", "", colnames(pathway_ko3))
+```
+
+```{r}
+library(tidyr)
+long_wt1 <- gather(pathway_wt1, cluster, score, Early_progenitors:Transient_amplifying_progenitors, factor_key=TRUE)
+long_wt2 <- gather(pathway_wt2, cluster, score, Early_progenitors:Transient_amplifying_progenitors, factor_key=TRUE)
+long_wt3 <- gather(pathway_wt3, cluster, score, Early_progenitors:Transient_amplifying_progenitors, factor_key=TRUE)
+
+long_ko1 <- gather(pathway_ko1, cluster, score, Early_progenitors:Transient_amplifying_progenitors, factor_key=TRUE)
+long_ko2 <- gather(pathway_ko2, cluster, score, Early_progenitors:Transient_amplifying_progenitors, factor_key=TRUE)
+long_ko3 <- gather(pathway_ko3, cluster, score, Early_progenitors:Transient_amplifying_progenitors, factor_key=TRUE)
+
+long_wt1$HTO <- 'WT1'
+long_wt2$HTO <- 'WT2'
+long_wt3$HTO <- 'WT3'
+
+long_ko1$HTO <- 'KO1'
+long_ko2$HTO <- 'KO2'
+long_ko3$HTO <- 'KO3'
+
+
+pathway <- rbind(long_wt1, long_wt2, long_wt3, long_ko1, long_ko2, long_ko3)
+pathway_wide <- spread(pathway, HTO, score)
+pathway_wide<- pathway_wide[complete.cases(pathway_wide), ]
+pathway_wide <- subset(pathway_wide, pathway_wide$cluster != "Residual")
+pathway_long <- gather(pathway_wide, HTO, score, KO1:WT3, factor_key=TRUE)
+
+hto_phenotype_map <- data.frame(
+  HTO = c("WT1", "WT2", "WT3", "KO1", "KO2", "KO3"),
+  phenotype = c("WT", "WT", "WT", "KO", "KO", "KO")
+)
+
+df <- pathway_long %>%
+  left_join(hto_phenotype_map, by = "HTO")
+
+
+```
+
+long_wt <- gather(pathway_wt, cluster, score, Early_progenitors:Transient_amplifying_progenitors, factor_key=TRUE)
+```{r}
+calculate_p_values <- function(df) {
+  p_values_df <- df %>%
+    group_by(Name, cluster) %>%
+    summarize(p_value = t.test(score[phenotype == "WT"], score[phenotype == "KO"])$p.value) %>%
+    ungroup()
+
+  return(p_values_df)
+}
+
+p_values <- calculate_p_values(df)
+print(p_values)
+```
+```{r}
+library(dplyr)
+
+mean_df <- df %>%
+    group_by(Name, cluster, phenotype) %>%
+    summarize(mean_score = mean(score, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = phenotype, values_from = mean_score)
+
+combined_df <- dplyr::left_join(mean_df, p_values, by = c("Name", "cluster"))
+sig_df <- subset(combined_df, p_value< 0.01)
+sig_df$diff <- sig_df$KO - sig_df$WT
+```
+
+```{r}
+# Assuming your data frame is called 'df'
+# and the columns are named 'KO', 'WT', 'difference', and 'cluster'
+
+result_list <- list() # Initialize an empty list to store results
+
+unique_clusters <- unique(sig_df$cluster) # Get unique cluster values
+
+for (cluster_val in unique_clusters) {
+  cluster_df <- sig_df[sig_df$cluster == cluster_val, ] # Subset data for the current cluster
+
+  if (nrow(cluster_df) > 0) { # Check if there are any rows for the current cluster
+    cluster_df_ordered <- cluster_df[order(cluster_df$diff), ] # Order by difference
+
+    top3 <- tail(cluster_df_ordered, 3)
+    bottom3 <- head(cluster_df_ordered, 3)
+
+    result_list[[cluster_val]] <- rbind(bottom3, top3) # Store results in the list, including all columns
+  }else{
+    result_list[[cluster_val]] <- NULL # if no rows for the cluster, store NULL.
+  }
+}
+
+# result_list now contains a list of data frames,
+# where each element is the top 3 and bottom 3 rows
+# for a specific cluster.
+
+# Example of accessing the result for cluster "A":
+# result_list$A
+
+#If you want to combine everything into one dataframe, but keep track of the cluster.
+combined_df <- do.call(rbind, lapply(names(result_list), function(name) {
+  if(!is.null(result_list[[name]])){
+    cbind(result_list[[name]], cluster_original = name) # Retains all original columns
+  }
+}))
+```
+
+
+```{r}
+plot <- ggplot(
+  combined_df %>%
+    pivot_longer(cols = c("WT", "KO"), names_to = "phenotype", values_to = "mean_score") %>%
+    group_by(cluster_original) %>%
+    mutate(
+      Name = factor(
+        Name,
+        levels = unique((.) %>% filter(phenotype == "KO") %>% arrange(desc(mean_score)) %>% pull(Name))
+      )
+    ),
+  aes(y = Name, x = mean_score, fill = phenotype)
+) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~ cluster_original, scales = "free_y") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title = "Mean Pathway Scores by Cluster and Phenotype",
+    x = "Mean Score",
+    y = "Name",
+    fill = "Phenotype"
+  )
+
+plot
+```
+
+```{r}
+sessionInfo()
+```
+
